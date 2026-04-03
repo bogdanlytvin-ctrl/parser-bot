@@ -1,0 +1,23 @@
+{% extends "base.html" %}{% block content %}
+<h5 class="mb-4">👥 Користувачі ({{ total }})</h5>
+<div class="card">
+  <table class="table table-hover table-sm mb-0">
+    <thead class="table-dark"><tr><th>ID</th><th>Ім'я</th><th>Username</th><th>Telegram ID</th><th>Задач</th><th>Активних</th><th>Зареєстрований</th></tr></thead>
+    <tbody>{% for u in users %}
+    <tr>
+      <td class="text-muted small">{{ u.id }}</td>
+      <td>{{ u.first_name or '—' }}</td>
+      <td class="small text-muted">{% if u.username %}<span>@{{ u.username }}</span>{% else %}—{% endif %}</td>
+      <td class="small text-muted">{{ u.telegram_id }}</td>
+      <td>{{ u.tasks_count }}</td>
+      <td>{% if u.active_count > 0 %}<span class="badge bg-success">{{ u.active_count }}</span>{% else %}<span class="text-muted">0</span>{% endif %}</td>
+      <td class="small text-muted">{{ u.created_at[:10] if u.created_at else '—' }}</td>
+    </tr>{% endfor %}</tbody>
+  </table>
+</div>
+<nav class="mt-3"><ul class="pagination pagination-sm">
+  {% if page>1 %}<li class="page-item"><a class="page-link" href="?page={{ page-1 }}">←</a></li>{% endif %}
+  <li class="page-item disabled"><a class="page-link">{{ page }}/{{ ((total-1)//per_page+1) if total else 1 }}</a></li>
+  {% if page*per_page<total %}<li class="page-item"><a class="page-link" href="?page={{ page+1 }}">→</a></li>{% endif %}
+</ul></nav>
+{% endblock %}
