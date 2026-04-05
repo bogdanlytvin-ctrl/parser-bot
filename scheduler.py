@@ -47,6 +47,22 @@ COUNTRY_FLAGS = {
 }
 
 
+async def run_task_now(task_id: int, send_fn: SendFn) -> None:
+    """Негайно запускає задачу незалежно від розкладу (ручний тригер)."""
+    task = db.get_task(task_id)
+    if not task:
+        return
+    async with aiohttp.ClientSession() as session:
+        try:
+            await _run_task(session, task, send_fn)
+        except Exception as e:
+            logger.error("Manual run error task %d: %s", task_id, e)
+        finally:
+            now      = datetime.now(timezone.utc)
+            next_run = now + timedelta(minutes=task["interval_min"])
+            db.update_task_schedule(task_id, now.isoformat(), next_run.isoformat())
+
+
 async def run_scheduler(send_fn: SendFn) -> None:
     logger.info("Scheduler started. Interval: %ds, AI filter: %s",
                 SCAN_INTERVAL, "enabled" if ANTHROPIC_API_KEY else "disabled (no API key)")

@@ -202,6 +202,17 @@ def get_task_results(task_id: int, limit: int = 10) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def update_task_fields(task_id: int, **fields) -> None:
+    allowed = {"name", "source_url", "keywords", "interval_min", "channel_id", "ai_filter"}
+    cols = {k: v for k, v in fields.items() if k in allowed}
+    if not cols:
+        return
+    sets = ", ".join(f"{k}=?" for k in cols)
+    vals = list(cols.values()) + [task_id]
+    with get_conn() as conn:
+        conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals)
+
+
 def count_task_results(task_id: int) -> int:
     with get_conn() as conn:
         return conn.execute(
