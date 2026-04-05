@@ -1,5 +1,5 @@
 """
-RSS / Atom feed parser + Google News RSS.
+RSS / Atom feed parser + Google News RSS (multi-country).
 
 source_url examples:
   https://feeds.bbci.co.uk/news/rss.xml
@@ -7,6 +7,7 @@ source_url examples:
 """
 import logging
 import re
+import urllib.parse
 
 import aiohttp
 import feedparser
@@ -15,11 +16,19 @@ from parsers import ParsedItem
 
 logger = logging.getLogger(__name__)
 
+_GOOGLE_CONFIGS = {
+    "ua":    ("uk", "UA", "uk"),
+    "us":    ("en", "US", "en"),
+    "eu":    ("en", "GB", "en"),
+    "ca":    ("en", "CA", "en"),
+    "world": ("en", "US", "en"),
+}
 
-def google_news_url(query: str, lang: str = "uk") -> str:
-    import urllib.parse
+
+def google_news_url(query: str, country: str = "ua") -> str:
+    lang, gl, ceid_lang = _GOOGLE_CONFIGS.get(country, ("en", "US", "en"))
     q = urllib.parse.quote(query)
-    return f"https://news.google.com/rss/search?q={q}&hl={lang}&gl=UA&ceid=UA:{lang}"
+    return f"https://news.google.com/rss/search?q={q}&hl={lang}&gl={gl}&ceid={gl}:{ceid_lang}"
 
 
 async def parse(session: aiohttp.ClientSession,
