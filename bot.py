@@ -48,8 +48,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 COUNTRIES = ["ua", "us", "eu", "ca", "world"]
 
-ALL_SOURCES = ["rss", "google", "olx", "rozetka", "dou", "telegram", "web"]
-# UA-only sources
 UA_SOURCES  = ["rss", "google", "olx", "rozetka", "dou", "telegram", "web"]
 # International (no OLX/Rozetka/DOU)
 INT_SOURCES = ["rss", "google", "telegram", "web"]
@@ -79,9 +77,18 @@ def _lang(context: ContextTypes.DEFAULT_TYPE, tg_id: int | None = None) -> str:
 # -- Keyboards --------------------------------------------------------------
 
 def _lang_kb() -> InlineKeyboardMarkup:
+    """Використовується під час /start (перший візит). Prefix: lang:"""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🇺🇦 Українська", callback_data="lang:ua"),
         InlineKeyboardButton("🇬🇧 English",    callback_data="lang:en"),
+    ]])
+
+
+def _settings_lang_kb() -> InlineKeyboardMarkup:
+    """Використовується в /settings. Prefix: setlang:"""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🇺🇦 Українська", callback_data="setlang:ua"),
+        InlineKeyboardButton("🇬🇧 English",    callback_data="setlang:en"),
     ]])
 
 
@@ -251,17 +258,23 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lang = _lang(context, update.effective_user.id)
     await update.message.reply_text(
         t(lang, "settings_menu"),
-        reply_markup=_lang_kb(),
+        reply_markup=_settings_lang_kb(),
     )
 
 
 async def on_settings_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє зміну мови з /settings (prefix setlang:)."""
     q = update.callback_query
     await q.answer()
     new_lang = q.data.split(":")[1]
     db.set_user_lang(q.from_user.id, new_lang)
     context.user_data["lang"] = new_lang
-    await q.edit_message_text(t(new_lang, "lang_changed"))
+    await q.edit_message_text(
+        t(new_lang, "lang_changed"),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Menu", callback_data="back:tasks"),
+        ]]),
+    )
 
 
 # -- /help ------------------------------------------------------------------
@@ -318,7 +331,7 @@ async def on_task_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = t(lang, "task_info",
              name=task["name"],
              source_type=task["source_type"].upper(),
-             country=(task.get("country") or "ua").upper(),
+             country=(task["country"] or "ua").upper(),
              interval=task["interval_min"],
              channel=task["channel_id"],
              ai=ai_txt,
@@ -493,10 +506,7 @@ async def conv_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     raw  = update.message.text.strip()
     context.user_data["keywords"] = "" if raw == t(lang, "btn_skip") else raw
 
-    await update.message.reply_text(
-        t(lang, "step_interval"),
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await update.message.reply_text("✅", reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text(
         t(lang, "step_interval"),
         reply_markup=_interval_kb(lang),
@@ -596,11 +606,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lang = _lang(context, user.id)
     text = update.message.text
 
-    if text == t(lang, "btn_my_tasks") or text == "📋 Мої задачі" or text == "📂 My tasks":
+    if text == t(lang, "btn_my_tasks") or text == t("ua", "btn_my_tasks") or text == t("en", "btn_my_tasks"):
         await cmd_tasks(update, context)
-    elif text == t(lang, "btn_settings") or text == "⚙️ Налаштування" or text == "⚙️ Settings":
+    elif text == t(lang, "btn_settings") or text == t("ua", "btn_settings") or text == t("en", "btn_settings"):
         await cmd_settings(update, context)
-    elif text == t(lang, "btn_help") or text == "❓ Допомога" or text == "❓ Help":
+    elif text == t(lang, "btn_help") or text == t("ua", "btn_help") or text == t("en", "btn_help"):
         await cmd_help(update, context)
     else:
         row = db.get_user(user.id)
@@ -627,7 +637,7 @@ async def post_init(app: Application) -> None:
         BotCommand("cancel",   "Cancel current action"),
     ])
 
-    asyncio.get_event_loop().create_task(run_scheduler(_send_to_channel))
+    asyncio.create_task(run_scheduler(_send_to_channel))
     logger.info("Scheduler task started.")
 
 
@@ -642,9 +652,8 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     _app = app
 
-    # Language selection (handles first-visit lang callback)
-    app.add_handler(CallbackQueryHandler(on_lang_select,    pattern=r"^lang:"))
-    app.add_handler(CallbackQueryHandler(on_settings_lang,  pattern=r"^lang:"))
+    # Зміна мови з /settings (окремий prefix, щоб не конфліктувати з start_conv)
+    app.add_handler(CallbackQueryHandler(on_settings_lang, pattern=r"^setlang:"))
 
     # Conversation handler for creating a task
     conv = ConversationHandler(

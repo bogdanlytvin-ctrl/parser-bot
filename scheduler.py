@@ -88,8 +88,8 @@ async def _run_task(session: aiohttp.ClientSession,
 
     keywords   = [k.strip() for k in (task["keywords"] or "").split(",") if k.strip()]
     source_url = task["source_url"] or ""
-    country    = task.get("country") or "ua"
-    ai_filter  = bool(task.get("ai_filter"))
+    country    = task["country"] or "ua"
+    ai_filter  = bool(task["ai_filter"])
 
     # Build proper URL for Google News with country support
     if source_type == "google":
@@ -131,8 +131,8 @@ async def _ai_filter(session: aiohttp.ClientSession,
     Returns True if relevant, False if should be skipped.
     """
     task_name = task["name"]
-    keywords  = task.get("keywords") or ""
-    niche     = task.get("niche") or ""
+    keywords  = task["keywords"] or ""
+    niche     = task["niche"] or ""
 
     prompt = (
         f"Task: '{task_name}' (niche: {niche}, keywords: {keywords})\n"
