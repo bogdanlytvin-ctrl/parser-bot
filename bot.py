@@ -1,12 +1,10 @@
 """
-Parser Bot — Telegram bot for managing parsing tasks.
+Parser Bot — multi-language, multi-country, multi-niche parsing bot.
 
-Flow:
-  /start → main menu
-  Нова задача → вибрати джерело → ввести URL/запит → ввести ключові слова
-               → вибрати інтервал → ввести канал → підтвердити → збережено
-  /tasks  → список задач з кнопками вкл/викл/видалити
-  /help   → довідка
+Conversation flow (9 steps):
+  /start → language select → main menu
+  New task → country → niche (or custom) → source → url → keywords
+           → interval → channel → AI filter → name → created
 """
 import asyncio
 import logging
@@ -28,6 +26,8 @@ from telegram.ext import (
 
 import database as db
 from scheduler import run_scheduler
+from lang import t
+from niches import COUNTRY_NICHES, get_template
 
 load_dotenv()
 
@@ -41,57 +41,91 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # ConversationHandler states
 (
-    S_SOURCE, S_URL, S_KEYWORDS,
-    S_INTERVAL, S_CHANNEL, S_CONFIRM
-) = range(6)
+    S_LANG,
+    S_COUNTRY, S_NICHE, S_SOURCE, S_URL, S_KEYWORDS,
+    S_INTERVAL, S_CHANNEL, S_AI, S_NAME,
+) = range(10)
 
-# Sources
-SOURCES = {
-    "rss":     ("📡 RSS Feed",     "Будь-який RSS/Atom URL"),
-    "google":  ("🔍 Google News",  "Пошуковий запит"),
-    "olx":     ("🛒 OLX",          "Пошуковий запит або URL"),
-    "rozetka": ("🛍 Rozetka",      "Назва товару"),
-    "dou":     ("💼 DOU Jobs",     "Категорія: Python, JS, QA..."),
-    "web":     ("🌐 Будь-який сайт", "URL сторінки"),
-}
+COUNTRIES = ["ua", "us", "eu", "ca", "world"]
 
-INTERVALS = [15, 30, 45, 60, 180, 360, 720, 1440]
-INTERVAL_LABELS = {
-    15: "15 хв", 30: "30 хв", 45: "45 хв", 60: "1 год",
-    180: "3 год", 360: "6 год", 720: "12 год", 1440: "24 год",
-}
+ALL_SOURCES = ["rss", "google", "olx", "rozetka", "dou", "telegram", "web"]
+# UA-only sources
+UA_SOURCES  = ["rss", "google", "olx", "rozetka", "dou", "telegram", "web"]
+# International (no OLX/Rozetka/DOU)
+INT_SOURCES = ["rss", "google", "telegram", "web"]
+
+INTERVALS = [15, 30, 45, 60, 120, 240, 720, 1440]
 
 # Rate limiting
 _rate: dict[int, list[float]] = defaultdict(list)
-
 _app: Application | None = None
 
 
 def _rate_ok(tg_id: int, limit: int = 10, window: int = 60) -> bool:
     now = time.time()
-    _rate[tg_id] = [t for t in _rate[tg_id] if now - t < window]
+    _rate[tg_id] = [ts for ts in _rate[tg_id] if now - ts < window]
     if len(_rate[tg_id]) >= limit:
         return False
     _rate[tg_id].append(now)
     return True
 
 
-# ── Keyboards ──────────────────────────────────────────────────────────────
+def _lang(context: ContextTypes.DEFAULT_TYPE, tg_id: int | None = None) -> str:
+    return context.user_data.get("lang") or (
+        db.get_user_lang(tg_id) if tg_id else "ua"
+    )
 
-def _source_kb() -> InlineKeyboardMarkup:
+
+# -- Keyboards --------------------------------------------------------------
+
+def _lang_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🇺🇦 Українська", callback_data="lang:ua"),
+        InlineKeyboardButton("🇬🇧 English",    callback_data="lang:en"),
+    ]])
+
+
+def _country_kb(lang: str) -> InlineKeyboardMarkup:
     rows = []
-    for key, (label, _) in SOURCES.items():
-        rows.append([InlineKeyboardButton(label, callback_data=f"src:{key}")])
+    row = []
+    for c in COUNTRIES:
+        row.append(InlineKeyboardButton(t(lang, f"country_{c}"), callback_data=f"country:{c}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
-def _interval_kb() -> InlineKeyboardMarkup:
+def _niche_kb(lang: str, country: str) -> InlineKeyboardMarkup:
+    niches = COUNTRY_NICHES.get(country, [])
     rows = []
     row = []
-    for i, mins in enumerate(INTERVALS):
-        row.append(InlineKeyboardButton(
-            INTERVAL_LABELS[mins], callback_data=f"int:{mins}"
-        ))
+    for n in niches:
+        row.append(InlineKeyboardButton(t(lang, f"niche_{n}"), callback_data=f"niche:{n}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(t(lang, "niche_custom"), callback_data="niche:custom")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _source_kb(lang: str, country: str) -> InlineKeyboardMarkup:
+    sources = UA_SOURCES if country == "ua" else INT_SOURCES
+    rows = [[InlineKeyboardButton(t(lang, f"src_{s}"), callback_data=f"src:{s}")]
+            for s in sources]
+    return InlineKeyboardMarkup(rows)
+
+
+def _interval_kb(lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for mins in INTERVALS:
+        key = f"interval_{mins}"
+        row.append(InlineKeyboardButton(t(lang, key), callback_data=f"int:{mins}"))
         if len(row) == 4:
             rows.append(row)
             row = []
@@ -100,38 +134,47 @@ def _interval_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _tasks_kb(tasks: list) -> InlineKeyboardMarkup:
-    rows = []
-    for t in tasks:
-        status = "✅" if t["is_active"] else "⏸"
-        rows.append([
-            InlineKeyboardButton(
-                f"{status} {t['name'][:25]}", callback_data=f"info:{t['id']}"
-            )
-        ])
-    return InlineKeyboardMarkup(rows)
+def _ai_kb(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t(lang, "btn_ai_yes"), callback_data="ai:yes"),
+        InlineKeyboardButton(t(lang, "btn_ai_no"),  callback_data="ai:no"),
+    ]])
 
 
-def _task_action_kb(task_id: int, is_active: bool) -> InlineKeyboardMarkup:
-    toggle_label = "⏸ Вимкнути" if is_active else "▶️ Увімкнути"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(toggle_label, callback_data=f"toggle:{task_id}"),
-            InlineKeyboardButton("🗑 Видалити",  callback_data=f"delete:{task_id}"),
-        ],
-        [InlineKeyboardButton("← Назад", callback_data="back:tasks")],
-    ])
+def _skip_kb(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[t(lang, "btn_skip")]], resize_keyboard=True)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-def _main_menu_kb() -> ReplyKeyboardMarkup:
+def _main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["➕ Нова задача", "📋 Мої задачі"],
-         ["ℹ️ Довідка"]],
+        [[t(lang, "btn_new_task"), t(lang, "btn_my_tasks")],
+         [t(lang, "btn_settings"), t(lang, "btn_help")]],
         resize_keyboard=True,
     )
 
+
+def _tasks_kb(tasks: list) -> InlineKeyboardMarkup:
+    rows = []
+    for task in tasks:
+        status = "✅" if task["is_active"] else "⏸"
+        rows.append([InlineKeyboardButton(
+            f"{status} {task['name'][:28]}", callback_data=f"info:{task['id']}"
+        )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _task_action_kb(lang: str, task_id: int, is_active: bool) -> InlineKeyboardMarkup:
+    toggle = "⏸ Pause" if is_active else "▶️ Resume"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(toggle,              callback_data=f"toggle:{task_id}"),
+            InlineKeyboardButton(t(lang, "btn_delete"), callback_data=f"delete:{task_id}"),
+        ],
+        [InlineKeyboardButton(t(lang, "btn_back"), callback_data="back:tasks")],
+    ])
+
+
+# -- Send to channel --------------------------------------------------------
 
 async def _send_to_channel(channel_id: str, text: str, photo_url: str = "") -> None:
     if _app is None:
@@ -155,64 +198,103 @@ async def _send_to_channel(channel_id: str, text: str, photo_url: str = "") -> N
         logger.warning("Send to channel %s failed: %s", channel_id, e)
 
 
-# ── /start ─────────────────────────────────────────────────────────────────
+# -- /start -----------------------------------------------------------------
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     db.upsert_user(user.id, user.first_name, user.username)
+    row = db.get_user(user.id)
+
+    # First visit — ask language
+    if not row or not row["lang"]:
+        await update.message.reply_text(
+            t("ua", "welcome", name=user.first_name),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_lang_kb(),
+        )
+        return S_LANG
+
+    lang = row["lang"]
+    context.user_data["lang"] = lang
+    tasks = db.get_user_tasks(row["id"])
+    active = sum(1 for t_ in tasks if t_["is_active"])
     await update.message.reply_text(
-        f"Привіт, {user.first_name}! 👋\n\n"
-        "🤖 <b>Parser Bot</b> — автоматичний збір даних з сайтів.\n\n"
-        "Обери дію:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_main_menu_kb(),
+        t(lang, "main_menu", count=active),
+        reply_markup=_main_menu_kb(lang),
+    )
+    return ConversationHandler.END
+
+
+async def on_lang_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    lang = q.data.split(":")[1]
+    db.set_user_lang(q.from_user.id, lang)
+    context.user_data["lang"] = lang
+
+    row = db.get_user(q.from_user.id)
+    tasks = db.get_user_tasks(row["id"]) if row else []
+    active = sum(1 for t_ in tasks if t_["is_active"])
+    await q.edit_message_text(
+        t(lang, "main_menu", count=active),
+    )
+    await q.message.reply_text(
+        t(lang, "main_menu", count=active),
+        reply_markup=_main_menu_kb(lang),
+    )
+    return ConversationHandler.END
+
+
+# -- /settings --------------------------------------------------------------
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = _lang(context, update.effective_user.id)
+    await update.message.reply_text(
+        t(lang, "settings_menu"),
+        reply_markup=_lang_kb(),
     )
 
+
+async def on_settings_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    new_lang = q.data.split(":")[1]
+    db.set_user_lang(q.from_user.id, new_lang)
+    context.user_data["lang"] = new_lang
+    await q.edit_message_text(t(new_lang, "lang_changed"))
+
+
+# -- /help ------------------------------------------------------------------
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = _lang(context, update.effective_user.id)
     await update.message.reply_text(
-        "<b>Як користуватись Parser Bot:</b>\n\n"
-        "1️⃣ Натисни <b>➕ Нова задача</b>\n"
-        "2️⃣ Вибери джерело (OLX, RSS, Rozetka...)\n"
-        "3️⃣ Введи пошуковий запит або URL\n"
-        "4️⃣ Введи ключові слова для фільтрації\n"
-        "5️⃣ Вибери інтервал перевірки\n"
-        "6️⃣ Введи ID або @username каналу\n"
-        "   (бот має бути адміном каналу!)\n\n"
-        "<b>Управління задачами:</b>\n"
-        "📋 <b>Мої задачі</b> — список, вмикати/вимикати/видаляти\n\n"
-        "<b>Підтримувані джерела:</b>\n"
-        "• RSS/Atom feeds\n"
-        "• Google News (пошук по темі)\n"
-        "• OLX Ukraine\n"
-        "• Rozetka\n"
-        "• DOU Jobs\n"
-        "• Будь-який сайт (універсальний парсер)",
+        t(lang, "help_text"),
         parse_mode=ParseMode.HTML,
-        reply_markup=_main_menu_kb(),
+        reply_markup=_main_menu_kb(lang),
     )
 
 
-# ── /tasks ─────────────────────────────────────────────────────────────────
+# -- /tasks -----------------------------------------------------------------
 
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    user_row = db.get_user(user.id)
-    if not user_row:
+    lang = _lang(context, user.id)
+    row  = db.get_user(user.id)
+    if not row:
         db.upsert_user(user.id, user.first_name, user.username)
-        user_row = db.get_user(user.id)
+        row = db.get_user(user.id)
 
-    tasks = db.get_user_tasks(user_row["id"])
+    tasks = db.get_user_tasks(row["id"])
     if not tasks:
         await update.message.reply_text(
-            "У тебе поки немає задач.\nНатисни <b>➕ Нова задача</b> щоб створити.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_main_menu_kb(),
+            t(lang, "no_tasks"),
+            reply_markup=_main_menu_kb(lang),
         )
         return
 
     await update.message.reply_text(
-        f"📋 <b>Твої задачі ({len(tasks)}):</b>",
+        f"📋 <b>{len(tasks)}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=_tasks_kb(tasks),
     )
@@ -221,125 +303,203 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_task_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
+    lang    = _lang(context, q.from_user.id)
     task_id = int(q.data.split(":")[1])
-    task = db.get_task(task_id)
+    task    = db.get_task(task_id)
     if not task:
-        await q.edit_message_text("Задача не знайдена.")
+        await q.edit_message_text("Not found.")
         return
 
     count  = db.count_task_results(task_id)
-    status = "✅ Активна" if task["is_active"] else "⏸ Призупинена"
-    source = task["source_type"].upper()
-    last   = task["last_run_at"][:16] if task["last_run_at"] else "ще не запускалась"
-    next_  = task["next_run_at"][:16] if task["next_run_at"] else "—"
+    status = t(lang, "status_active") if task["is_active"] else t(lang, "status_paused")
+    ai_txt = t(lang, "ai_on") if task["ai_filter"] else t(lang, "ai_off")
+    last   = task["last_run_at"][:16] if task["last_run_at"] else t(lang, "never")
 
-    text = (
-        f"<b>{task['name']}</b>\n\n"
-        f"Статус: {status}\n"
-        f"Джерело: {source}\n"
-        f"Запит: <code>{task['source_url'] or '—'}</code>\n"
-        f"Ключові слова: {task['keywords'] or 'всі'}\n"
-        f"Інтервал: {INTERVAL_LABELS.get(task['interval_min'], str(task['interval_min'])+'хв')}\n"
-        f"Канал: {task['channel_id']}\n"
-        f"Знайдено записів: {count}\n"
-        f"Останній запуск: {last}\n"
-        f"Наступний: {next_}"
-    )
+    text = t(lang, "task_info",
+             name=task["name"],
+             source_type=task["source_type"].upper(),
+             country=(task.get("country") or "ua").upper(),
+             interval=task["interval_min"],
+             channel=task["channel_id"],
+             ai=ai_txt,
+             status=status,
+             results=count,
+             last_run=last)
+
     await q.edit_message_text(
         text, parse_mode=ParseMode.HTML,
-        reply_markup=_task_action_kb(task_id, bool(task["is_active"]))
+        reply_markup=_task_action_kb(lang, task_id, bool(task["is_active"]))
     )
 
 
 async def on_toggle_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    task_id  = int(q.data.split(":")[1])
+    lang    = _lang(context, q.from_user.id)
+    task_id = int(q.data.split(":")[1])
     new_state = db.toggle_task(task_id)
-    state_text = "увімкнена ✅" if new_state else "призупинена ⏸"
     task = db.get_task(task_id)
-    await q.edit_message_text(
-        f"Задача <b>{task['name'] if task else task_id}</b> {state_text}.",
-        parse_mode=ParseMode.HTML,
-    )
+    name = task["name"] if task else str(task_id)
+    msg  = t(lang, "task_resumed", name=name) if new_state else t(lang, "task_paused", name=name)
+    await q.edit_message_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def on_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
+    lang    = _lang(context, q.from_user.id)
     task_id = int(q.data.split(":")[1])
-    task = db.get_task(task_id)
-    name = task["name"] if task else str(task_id)
     db.delete_task(task_id)
-    await q.edit_message_text(f"Задача <b>{name}</b> видалена 🗑", parse_mode=ParseMode.HTML)
+    await q.edit_message_text(t(lang, "task_deleted"), parse_mode=ParseMode.HTML)
 
 
 async def on_back_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    user = update.effective_user
-    user_row = db.get_user(user.id)
-    tasks = db.get_user_tasks(user_row["id"]) if user_row else []
+    lang = _lang(context, q.from_user.id)
+    row  = db.get_user(q.from_user.id)
+    tasks = db.get_user_tasks(row["id"]) if row else []
     if not tasks:
-        await q.edit_message_text("Задач немає.")
+        await q.edit_message_text(t(lang, "no_tasks"))
         return
     await q.edit_message_text(
-        f"📋 <b>Твої задачі ({len(tasks)}):</b>",
+        f"📋 <b>{len(tasks)}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=_tasks_kb(tasks),
     )
 
 
-# ── Conversation: Create Task ──────────────────────────────────────────────
+# -- Conversation: Create Task ---------------------------------------------
 
 async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
+    user = update.effective_user
+    lang = db.get_user_lang(user.id)
+    context.user_data["lang"] = lang
+
     await update.message.reply_text(
-        "🆕 <b>Нова задача</b>\n\nКрок 1/5 — Вибери джерело:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_source_kb(),
+        t(lang, "step_country"),
+        reply_markup=_country_kb(lang),
     )
-    return S_SOURCE
+    return S_COUNTRY
+
+
+async def conv_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    lang    = context.user_data.get("lang", "ua")
+    country = q.data.split(":")[1]
+    context.user_data["country"] = country
+
+    await q.edit_message_text(
+        t(lang, "step_niche"),
+        reply_markup=_niche_kb(lang, country),
+    )
+    return S_NICHE
+
+
+async def conv_niche(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    lang    = context.user_data.get("lang", "ua")
+    country = context.user_data.get("country", "ua")
+    niche   = q.data.split(":")[1]
+    context.user_data["niche"] = niche
+
+    if niche == "custom":
+        await q.edit_message_text(
+            t(lang, "step_source"),
+            reply_markup=_source_kb(lang, country),
+        )
+        return S_SOURCE
+
+    # Apply template
+    tpl = get_template(country, niche)
+    if tpl:
+        context.user_data["source_type"] = tpl.source_type
+        context.user_data["source_url"]  = tpl.source_url
+        context.user_data["keywords"]    = tpl.keywords
+        context.user_data["task_name_suggestion"] = (
+            tpl.name_ua if lang == "ua" else tpl.name_en
+        )
+
+        msg = t(lang, "tpl_applied",
+                name=(tpl.name_ua if lang == "ua" else tpl.name_en),
+                source_type=tpl.source_type.upper(),
+                url=tpl.source_url[:60],
+                keywords=tpl.keywords or "—")
+
+        await q.edit_message_text(
+            msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t(lang, "btn_accept_tpl"), callback_data="tpl:accept"),
+                InlineKeyboardButton("✏️ Edit URL",            callback_data="tpl:edit"),
+            ]]),
+        )
+        return S_URL
+    else:
+        await q.edit_message_text(
+            t(lang, "step_source"),
+            reply_markup=_source_kb(lang, country),
+        )
+        return S_SOURCE
+
+
+async def conv_tpl_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User accepted or wants to edit the niche template."""
+    q = update.callback_query
+    await q.answer()
+    lang   = context.user_data.get("lang", "ua")
+    choice = q.data.split(":")[1]
+
+    if choice == "accept":
+        # Skip URL/keywords — go straight to interval
+        await q.edit_message_text(t(lang, "step_interval"),
+                                   reply_markup=_interval_kb(lang))
+        return S_INTERVAL
+    else:
+        # Edit: show URL prompt with pre-filled value
+        await q.edit_message_text(
+            t(lang, "step_url") + f"\n\n<code>{context.user_data.get('source_url', '')}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return S_URL
 
 
 async def conv_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    key = q.data.split(":")[1]
-    label, hint = SOURCES[key]
-    context.user_data["source_type"] = key
+    lang = context.user_data.get("lang", "ua")
+    context.user_data["source_type"] = q.data.split(":")[1]
 
-    await q.edit_message_text(
-        f"✅ Джерело: <b>{label}</b>\n\n"
-        f"Крок 2/5 — Введи запит або URL\n"
-        f"<i>Підказка: {hint}</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await q.edit_message_text(t(lang, "step_url"), parse_mode=ParseMode.HTML)
     return S_URL
 
 
 async def conv_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ua")
     context.user_data["source_url"] = update.message.text.strip()
+
     await update.message.reply_text(
-        "Крок 3/5 — Введи ключові слова через кому\n"
-        "<i>Наприклад: iPhone, 128gb, нова</i>\n"
-        "Або натисни <b>-</b> щоб отримувати всі результати:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardMarkup([["-"]], resize_keyboard=True),
+        t(lang, "step_keywords"),
+        reply_markup=_skip_kb(lang),
     )
     return S_KEYWORDS
 
 
 async def conv_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-    context.user_data["keywords"] = "" if raw == "-" else raw
+    lang = context.user_data.get("lang", "ua")
+    raw  = update.message.text.strip()
+    context.user_data["keywords"] = "" if raw == t(lang, "btn_skip") else raw
+
     await update.message.reply_text(
-        "Крок 4/5 — Вибери інтервал перевірки:",
+        t(lang, "step_interval"),
         reply_markup=ReplyKeyboardRemove(),
     )
     await update.message.reply_text(
-        "⏱ Як часто перевіряти?",
-        reply_markup=_interval_kb(),
+        t(lang, "step_interval"),
+        reply_markup=_interval_kb(lang),
     )
     return S_INTERVAL
 
@@ -347,111 +507,124 @@ async def conv_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def conv_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    mins = int(q.data.split(":")[1])
-    context.user_data["interval_min"] = mins
+    lang = context.user_data.get("lang", "ua")
+    context.user_data["interval_min"] = int(q.data.split(":")[1])
 
-    await q.edit_message_text(
-        f"✅ Інтервал: <b>{INTERVAL_LABELS[mins]}</b>\n\n"
-        "Крок 5/5 — Введи <b>@username</b> або <b>ID</b> каналу\n"
-        "<i>Бот повинен бути адміністратором каналу!</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await q.edit_message_text(t(lang, "step_channel"), parse_mode=ParseMode.HTML)
     return S_CHANNEL
 
 
 async def conv_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang    = context.user_data.get("lang", "ua")
     channel = update.message.text.strip()
+
     if not channel.startswith("@") and not channel.lstrip("-").isdigit():
-        await update.message.reply_text(
-            "Введи @username каналу або числовий ID (наприклад -1001234567890):"
-        )
+        await update.message.reply_text(t(lang, "step_channel"), parse_mode=ParseMode.HTML)
         return S_CHANNEL
 
     context.user_data["channel_id"] = channel
+    await update.message.reply_text(t(lang, "step_ai"), reply_markup=_ai_kb(lang))
+    return S_AI
 
-    # Ask for task name
-    source_key = context.user_data["source_type"]
-    source_label = SOURCES[source_key][0]
-    kw = context.user_data["keywords"] or "всі"
-    interval = INTERVAL_LABELS[context.user_data["interval_min"]]
 
-    await update.message.reply_text(
-        "Останній крок — введи <b>назву задачі</b>\n"
-        "<i>Наприклад: iPhone OLX, Вакансії Python</i>",
+async def conv_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    lang = context.user_data.get("lang", "ua")
+    context.user_data["ai_filter"] = (q.data == "ai:yes")
+
+    suggestion = context.user_data.get("task_name_suggestion", "")
+    hint = f"\n<i>{suggestion}</i>" if suggestion else ""
+    await q.edit_message_text(
+        t(lang, "step_name") + hint,
         parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
     )
-    return S_CONFIRM
+    return S_NAME
 
 
-async def conv_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def conv_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ua")
     name = update.message.text.strip()[:50]
     d    = context.user_data
 
-    user = update.effective_user
+    user    = update.effective_user
     user_id = db.upsert_user(user.id, user.first_name, user.username)
 
-    task_id = db.create_task(
+    db.create_task(
         user_id      = user_id,
         name         = name,
-        source_type  = d["source_type"],
-        source_url   = d["source_url"],
-        keywords     = d["keywords"],
-        interval_min = d["interval_min"],
-        channel_id   = d["channel_id"],
+        source_type  = d.get("source_type", "rss"),
+        source_url   = d.get("source_url", ""),
+        keywords     = d.get("keywords", ""),
+        interval_min = d.get("interval_min", 60),
+        channel_id   = d.get("channel_id", ""),
+        country      = d.get("country", "ua"),
+        niche        = d.get("niche", "custom"),
+        ai_filter    = d.get("ai_filter", False),
     )
 
-    source_label = SOURCES[d["source_type"]][0]
-    kw_text = d["keywords"] if d["keywords"] else "без фільтру"
-    interval_text = INTERVAL_LABELS[d["interval_min"]]
-
+    ai_txt = t(lang, "ai_on") if d.get("ai_filter") else t(lang, "ai_off")
     await update.message.reply_text(
-        f"✅ <b>Задача створена!</b>\n\n"
-        f"📌 Назва: <b>{name}</b>\n"
-        f"📂 Джерело: {source_label}\n"
-        f"🔍 Запит: <code>{d['source_url']}</code>\n"
-        f"🏷 Ключові слова: {kw_text}\n"
-        f"⏱ Інтервал: {interval_text}\n"
-        f"📢 Канал: {d['channel_id']}\n\n"
-        "Перший запуск відбудеться через ~1 хвилину.",
+        t(lang, "task_created",
+          name=name,
+          source_type=d.get("source_type", "").upper(),
+          country=d.get("country", "ua").upper(),
+          interval=d.get("interval_min", 60),
+          channel=d.get("channel_id", ""),
+          ai=ai_txt),
         parse_mode=ParseMode.HTML,
-        reply_markup=_main_menu_kb(),
+        reply_markup=_main_menu_kb(lang),
     )
     context.user_data.clear()
     return ConversationHandler.END
 
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ua")
     context.user_data.clear()
     await update.message.reply_text(
-        "Скасовано.",
-        reply_markup=_main_menu_kb(),
+        t(lang, "task_cancelled"),
+        reply_markup=_main_menu_kb(lang),
     )
     return ConversationHandler.END
 
 
-# ── Text router (main menu buttons) ───────────────────────────────────────
+# -- Text router -----------------------------------------------------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    lang = _lang(context, user.id)
     text = update.message.text
-    if text == "📋 Мої задачі":
+
+    if text == t(lang, "btn_my_tasks") or text == "📋 Мої задачі" or text == "📂 My tasks":
         await cmd_tasks(update, context)
-    elif text == "ℹ️ Довідка":
+    elif text == t(lang, "btn_settings") or text == "⚙️ Налаштування" or text == "⚙️ Settings":
+        await cmd_settings(update, context)
+    elif text == t(lang, "btn_help") or text == "❓ Допомога" or text == "❓ Help":
         await cmd_help(update, context)
     else:
-        await cmd_start(update, context)
+        row = db.get_user(user.id)
+        lang = row["lang"] if row else "ua"
+        tasks = db.get_user_tasks(row["id"]) if row else []
+        active = sum(1 for t_ in tasks if t_["is_active"])
+        await update.message.reply_text(
+            t(lang, "main_menu", count=active),
+            reply_markup=_main_menu_kb(lang),
+        )
 
 
-# ── Setup ──────────────────────────────────────────────────────────────────
+# -- Setup -----------------------------------------------------------------
 
 async def post_init(app: Application) -> None:
     global _app
     _app = app
 
     await app.bot.set_my_commands([
-        BotCommand("start",  "Головне меню"),
-        BotCommand("tasks",  "Мої задачі"),
-        BotCommand("help",   "Довідка"),
+        BotCommand("start",    "Main menu"),
+        BotCommand("tasks",    "My tasks"),
+        BotCommand("settings", "Language settings"),
+        BotCommand("help",     "Help"),
+        BotCommand("cancel",   "Cancel current action"),
     ])
 
     asyncio.get_event_loop().create_task(run_scheduler(_send_to_channel))
@@ -469,39 +642,60 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     _app = app
 
+    # Language selection (handles first-visit lang callback)
+    app.add_handler(CallbackQueryHandler(on_lang_select,    pattern=r"^lang:"))
+    app.add_handler(CallbackQueryHandler(on_settings_lang,  pattern=r"^lang:"))
+
     # Conversation handler for creating a task
     conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^➕ Нова задача$"), conv_start),
-            CommandHandler("new", conv_start),
+            MessageHandler(
+                filters.Regex("^(➕ Нова задача|➕ New task)$"), conv_start
+            ),
+            CommandHandler("newtask", conv_start),
         ],
         states={
-            S_SOURCE:   [CallbackQueryHandler(conv_source,   pattern=r"^src:")],
-            S_URL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_url)],
+            S_COUNTRY:  [CallbackQueryHandler(conv_country,    pattern=r"^country:")],
+            S_NICHE:    [CallbackQueryHandler(conv_niche,      pattern=r"^niche:")],
+            S_SOURCE:   [CallbackQueryHandler(conv_source,     pattern=r"^src:")],
+            S_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_url),
+                CallbackQueryHandler(conv_tpl_choice, pattern=r"^tpl:"),
+            ],
             S_KEYWORDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_keywords)],
-            S_INTERVAL: [CallbackQueryHandler(conv_interval, pattern=r"^int:")],
+            S_INTERVAL: [CallbackQueryHandler(conv_interval,   pattern=r"^int:")],
             S_CHANNEL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_channel)],
-            S_CONFIRM:  [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_confirm)],
+            S_AI:       [CallbackQueryHandler(conv_ai,         pattern=r"^ai:")],
+            S_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_name)],
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CommandHandler("tasks", cmd_tasks))
+    # Start / settings (also handles first-visit language selection)
+    start_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            S_LANG: [CallbackQueryHandler(on_lang_select, pattern=r"^lang:")],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+
+    app.add_handler(start_conv)
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("tasks",    cmd_tasks))
+    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(conv)
 
-    # Inline button handlers
+    # Inline button handlers for task management
     app.add_handler(CallbackQueryHandler(on_task_info,   pattern=r"^info:"))
     app.add_handler(CallbackQueryHandler(on_toggle_task, pattern=r"^toggle:"))
     app.add_handler(CallbackQueryHandler(on_delete_task, pattern=r"^delete:"))
     app.add_handler(CallbackQueryHandler(on_back_tasks,  pattern=r"^back:tasks$"))
 
     # Main menu text buttons
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, on_text
-    ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     logger.info("Parser Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
